@@ -1,0 +1,481 @@
+// ============================================================================
+// CyberShield — frontend controller
+// ============================================================================
+
+const state = {
+  tools: [],
+  events: [],
+  stats: null,
+  selectedPivot: null,
+  charts: {},
+};
+
+// ---------------------------------------------------------------------------
+// Tab navigation
+// ---------------------------------------------------------------------------
+
+document.querySelectorAll(".nav-tab").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".nav-tab").forEach(b => b.classList.remove("active"));
+    document.querySelectorAll(".tab-panel").forEach(p => p.classList.remove("active"));
+    btn.classList.add("active");
+    document.getElementById(`tab-${btn.dataset.tab}`).classList.add("active");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
+
+let ws;
+function connectWs() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+  ws.onopen = () => setWsStatus(true);
+  ws.onclose = () => { setWsStatus(false); setTimeout(connectWs, 2000); };
+  ws.onerror = () => setWsStatus(false);
+
+  ws.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+    if (msg.type === "output") appendTerminalLine(msg.line);
+    if (msg.type === "status") appendTerminalStatus(msg.status);
+    if (msg.type === "event") { addEventToTicker(msg.event); refreshAll(); }
+    if (msg.type === "correlation") refreshStats();
+  };
+}
+
+function setWsStatus(online) {
+  const el = document.getElementById("wsStatus");
+  el.classList.toggle("online", online);
+  el.classList.toggle("offline", !online);
+  el.querySelector(".conn-label").textContent = online ? "Live" : "Reconnecting…";
+}
+
+// ---------------------------------------------------------------------------
+// API helpers
+// ---------------------------------------------------------------------------
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || `Request failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Tool Center
+// ---------------------------------------------------------------------------
+
+async function loadTools() {
+  state.tools = await api("/api/tools");
+  renderToolGrid();
+}
+
+function renderToolGrid() {
+  const grid = document.getElementById("toolGrid");
+  grid.innerHTML = "";
+  state.tools.forEach(tool => {
+    const card = document.createElement("div");
+    card.className = "tool-card";
+    card.innerHTML = `
+      <div class="tool-card-head">
+        <div>
+          <div class="tool-name">${escapeHtml(tool.name)}</div>
+          <div class="tool-category">${escapeHtml(tool.category)}</div>
+        </div>
+        <div class="status-badge ${tool.available ? "ready" : "missing"}">
+          ${tool.available ? "Ready" : "Not Installed"}
+        </div>
+      </div>
+      <p class="tool-desc">${escapeHtml(tool.description)}</p>
+      ${tool.available
+        ? `<div class="tool-params">${(tool.params || []).map(p => paramFieldHtml(tool.id, p)).join("")}</div>
+           <button class="btn-primary" data-launch="${tool.id}">Launch</button>
+           <div class="tool-progress" id="progress-${tool.id}"><div class="tool-progress-bar"></div></div>
+           <div class="run-result-line" id="result-${tool.id}"></div>`
+        : `<div class="tool-install-hint">Install: ${escapeHtml(tool.install || "see docs")}</div>`
+      }
+    `;
+    grid.appendChild(card);
+  });
+
+  grid.querySelectorAll("[data-launch]").forEach(btn => {
+    btn.addEventListener("click", () => launchTool(btn.dataset.launch));
+  });
+}
+
+function paramFieldHtml(toolId, p) {
+  const fieldId = `param-${toolId}-${p.name}`;
+  if (p.type === "select") {
+    return `<div class="param-field">
+      <label for="${fieldId}">${escapeHtml(p.label)}</label>
+      <select id="${fieldId}">
+        ${(p.options || []).map(o => `<option value="${o}" ${o === p.default ? "selected" : ""}>${o}</option>`).join("")}
+      </select>
+    </div>`;
+  }
+  return `<div class="param-field">
+    <label for="${fieldId}">${escapeHtml(p.label)}</label>
+    <input id="${fieldId}" type="text" placeholder="${escapeHtml(p.placeholder || "")}" value="${escapeHtml(p.default || "")}">
+  </div>`;
+}
+
+async function launchTool(toolId) {
+  const tool = state.tools.find(t => t.id === toolId);
+  const params = {};
+  (tool.params || []).forEach(p => {
+    const el = document.getElementById(`param-${toolId}-${p.name}`);
+    if (el) params[p.name] = el.value;
+  });
+
+  const progressEl = document.getElementById(`progress-${toolId}`);
+  const resultEl = document.getElementById(`result-${toolId}`);
+  progressEl.classList.add("active");
+  resultEl.textContent = "Launching…";
+
+  // Jump to Live Terminal so the user sees streaming output
+  document.querySelector('[data-tab="terminal"]').click();
+  appendTerminalStatus(`launching ${tool.name}…`);
+
+  try {
+    const res = await api(`/api/tools/${toolId}/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ params }),
+    });
+    resultEl.textContent = `Run ${res.run_id.slice(0, 8)} queued`;
+    pollRunCompletion(toolId, res.run_id, progressEl, resultEl);
+  } catch (err) {
+    progressEl.classList.remove("active");
+    resultEl.textContent = `Error: ${err.message}`;
+  }
+}
+
+async function pollRunCompletion(toolId, runId, progressEl, resultEl) {
+  for (let i = 0; i < 120; i++) {
+    await new Promise(r => setTimeout(r, 1500));
+    const runs = await api("/api/runs");
+    const run = runs.find(r => r.id === runId);
+    if (run && run.status !== "queued" && run.status !== "running") {
+      progressEl.classList.remove("active");
+      resultEl.textContent = `${run.status} (exit ${run.exit_code})`;
+      refreshAll();
+      return;
+    }
+  }
+  progressEl.classList.remove("active");
+}
+
+// ---------------------------------------------------------------------------
+// Live Terminal
+// ---------------------------------------------------------------------------
+
+function appendTerminalLine(line) {
+  const term = document.getElementById("terminalOutput");
+  const empty = term.querySelector(".term-muted");
+  if (empty && term.children.length === 1) empty.remove();
+  const div = document.createElement("div");
+  div.className = "term-line" + (line.startsWith("$") ? " term-cmd" : line.startsWith("ERROR") ? " term-error" : "");
+  div.textContent = line;
+  term.appendChild(div);
+  term.scrollTop = term.scrollHeight;
+}
+
+function appendTerminalStatus(status) {
+  const term = document.getElementById("terminalOutput");
+  const div = document.createElement("div");
+  div.className = "term-line term-status";
+  div.textContent = `[status] ${status}`;
+  term.appendChild(div);
+  term.scrollTop = term.scrollHeight;
+}
+
+document.getElementById("clearTerminalBtn").addEventListener("click", () => {
+  document.getElementById("terminalOutput").innerHTML = '<div class="term-line term-muted">Cleared.</div>';
+});
+
+// ---------------------------------------------------------------------------
+// Overview: stats, charts, ticker
+// ---------------------------------------------------------------------------
+
+async function refreshStats() {
+  state.stats = await api("/api/stats");
+  renderStats();
+}
+
+function renderStats() {
+  const s = state.stats;
+  document.getElementById("kpiEvents").textContent = s.total_events;
+  document.getElementById("kpiRuns").textContent = s.total_runs;
+  document.getElementById("kpiCritical").textContent = s.by_severity.critical || 0;
+  document.getElementById("kpiHigh").textContent = s.by_severity.high || 0;
+  document.getElementById("kpiTools").textContent = `${s.tools_available}/${s.tools_total}`;
+
+  document.getElementById("headerStats").innerHTML =
+    `<span>${s.tools_available}/${s.tools_total} tools ready</span><span>${s.total_events} findings</span>`;
+
+  // Shield gauge
+  const circumference = 427;
+  const offset = circumference - (s.shield_score / 100) * circumference;
+  const gauge = document.getElementById("gaugeFill");
+  gauge.style.strokeDashoffset = offset;
+  gauge.style.stroke = s.shield_score > 70 ? "var(--green)" : s.shield_score > 40 ? "var(--orange)" : "var(--red)";
+  document.getElementById("shieldScoreValue").textContent = s.shield_score;
+  document.getElementById("gaugeLegend").textContent =
+    s.total_events === 0 ? "Awaiting first scan…" :
+    s.shield_score > 70 ? "Posture looks healthy" :
+    s.shield_score > 40 ? "Moderate exposure detected" : "High exposure — review findings";
+
+  renderTrendChart(s.trend);
+  renderRiskDoughnut(s.by_severity);
+  renderModuleRadar(s.by_type);
+
+  // correlation count
+  api("/api/correlations").then(c => {
+    document.getElementById("kpiCorr").textContent = c.length;
+  });
+}
+
+function renderTrendChart(trend) {
+  const ctx = document.getElementById("trendChart");
+  const labels = trend.map(t => t.date.slice(5));
+  const data = trend.map(t => t.count);
+  if (state.charts.trend) { state.charts.trend.data.labels = labels; state.charts.trend.data.datasets[0].data = data; state.charts.trend.update(); return; }
+  state.charts.trend = new Chart(ctx, {
+    type: "line",
+    data: { labels, datasets: [{ data, borderColor: "#22d3ee", backgroundColor: "rgba(34,211,238,0.12)", fill: true, tension: 0.35, pointRadius: 2 }] },
+    options: chartBaseOptions(false),
+  });
+}
+
+function renderRiskDoughnut(bySeverity) {
+  const ctx = document.getElementById("riskDoughnut");
+  const order = ["critical", "high", "medium", "low", "info"];
+  const colors = { critical: "#c084fc", high: "#f87171", medium: "#fbbf24", low: "#22d3ee", info: "#556080" };
+  const labels = order.filter(k => bySeverity[k]);
+  const data = labels.map(k => bySeverity[k]);
+  if (state.charts.risk) { state.charts.risk.data.labels = labels; state.charts.risk.data.datasets[0].data = data; state.charts.risk.update(); return; }
+  state.charts.risk = new Chart(ctx, {
+    type: "doughnut",
+    data: { labels, datasets: [{ data, backgroundColor: labels.map(l => colors[l]), borderWidth: 0 }] },
+    options: { ...chartBaseOptions(true), cutout: "68%" },
+  });
+}
+
+function renderModuleRadar(byType) {
+  const ctx = document.getElementById("moduleRadar");
+  const labels = Object.keys(byType);
+  const data = Object.values(byType);
+  if (state.charts.radar) { state.charts.radar.data.labels = labels; state.charts.radar.data.datasets[0].data = data; state.charts.radar.update(); return; }
+  state.charts.radar = new Chart(ctx, {
+    type: "radar",
+    data: { labels, datasets: [{ data, borderColor: "#c084fc", backgroundColor: "rgba(192,132,252,0.15)", pointBackgroundColor: "#c084fc" }] },
+    options: {
+      ...chartBaseOptions(true),
+      scales: {
+        r: {
+          angleLines: { color: "rgba(255,255,255,0.06)" },
+          grid: { color: "rgba(255,255,255,0.06)" },
+          pointLabels: { color: "#8b98b5", font: { size: 10 } },
+          ticks: { display: false },
+        },
+      },
+    },
+  });
+}
+
+function chartBaseOptions(showLegend) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      legend: { display: showLegend, position: "bottom", labels: { color: "#8b98b5", boxWidth: 10, font: { size: 10.5 } } },
+    },
+    scales: showLegend ? {} : {
+      x: { ticks: { color: "#556080", font: { size: 9.5 } }, grid: { color: "rgba(255,255,255,0.04)" } },
+      y: { ticks: { color: "#556080", font: { size: 9.5 } }, grid: { color: "rgba(255,255,255,0.04)" }, beginAtZero: true },
+    },
+  };
+}
+
+function addEventToTicker(ev) {
+  const ticker = document.getElementById("eventTicker");
+  const empty = ticker.querySelector(".ticker-empty");
+  if (empty) empty.remove();
+  const item = document.createElement("div");
+  item.className = `ticker-item sev-${ev.severity}`;
+  const time = new Date(ev.timestamp || Date.now()).toLocaleTimeString();
+  item.innerHTML = `<span class="ticker-time">${time}</span><span class="ticker-msg">${escapeHtml(ev.message)}</span>`;
+  ticker.prepend(item);
+  while (ticker.children.length > 40) ticker.removeChild(ticker.lastChild);
+}
+
+// ---------------------------------------------------------------------------
+// Findings & Events table
+// ---------------------------------------------------------------------------
+
+async function loadEvents(filters = {}) {
+  const params = new URLSearchParams(filters);
+  state.events = await api(`/api/events?${params.toString()}`);
+  renderEventsTable();
+}
+
+function renderEventsTable() {
+  const body = document.getElementById("eventsTableBody");
+  if (!state.events.length) {
+    body.innerHTML = `<tr><td colspan="6" class="empty-row">No findings recorded yet.</td></tr>`;
+    return;
+  }
+  body.innerHTML = state.events.map(ev => `
+    <tr data-id="${ev.id}">
+      <td class="mono">${new Date(ev.timestamp).toLocaleString()}</td>
+      <td><span class="sev-pill ${ev.severity}">${ev.severity}</span></td>
+      <td>${escapeHtml(ev.tool_id || "")}</td>
+      <td class="mono">${escapeHtml(ev.host || ev.source_ip || "—")}</td>
+      <td>${escapeHtml(ev.finding_type || "")}</td>
+      <td>${escapeHtml(ev.message || "")}</td>
+    </tr>
+  `).join("");
+}
+
+document.getElementById("applyFilters").addEventListener("click", () => {
+  const search = document.getElementById("eventSearch").value.trim();
+  const severity = document.getElementById("severityFilter").value;
+  loadEvents({ ...(search && { search }), ...(severity && { severity }) });
+});
+
+// ---------------------------------------------------------------------------
+// Forensic Investigator
+// ---------------------------------------------------------------------------
+
+function renderPivotList() {
+  const counts = {};
+  state.events.forEach(ev => {
+    const key = ev.host || ev.source_ip;
+    if (!key) return;
+    counts[key] = (counts[key] || 0) + 1;
+  });
+  const list = document.getElementById("pivotList");
+  const entries = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 60);
+  if (!entries.length) {
+    list.innerHTML = `<div class="pivot-empty">Sources will appear here once events exist.</div>`;
+    return;
+  }
+  list.innerHTML = entries.map(([key, count]) => `
+    <div class="pivot-item ${state.selectedPivot === key ? "selected" : ""}" data-key="${escapeHtml(key)}">
+      <span>${escapeHtml(key)}</span><span class="pivot-count">${count}</span>
+    </div>
+  `).join("");
+  list.querySelectorAll(".pivot-item").forEach(item => {
+    item.addEventListener("click", () => selectPivot(item.dataset.key));
+  });
+}
+
+function selectPivot(key) {
+  state.selectedPivot = key;
+  renderPivotList();
+  const matching = state.events.filter(ev => ev.host === key || ev.source_ip === key)
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  document.getElementById("timelineLabel").textContent = `Event Timeline — ${key}`;
+  const timeline = document.getElementById("timeline");
+  if (!matching.length) {
+    timeline.innerHTML = `<div class="timeline-empty">No events for this pivot.</div>`;
+    return;
+  }
+  timeline.innerHTML = matching.map(ev => `
+    <div class="timeline-item sev-${ev.severity}" data-id="${ev.id}">
+      <div class="t-time">${new Date(ev.timestamp).toLocaleString()}</div>
+      <div>${escapeHtml(ev.message)}</div>
+    </div>
+  `).join("");
+  timeline.querySelectorAll(".timeline-item").forEach(item => {
+    item.addEventListener("click", () => showMeta(item.dataset.id));
+  });
+}
+
+function showMeta(eventId) {
+  const ev = state.events.find(e => e.id === eventId);
+  document.getElementById("metaViewer").textContent = JSON.stringify(ev, null, 2);
+}
+
+document.getElementById("exportCsvBtn").addEventListener("click", () => window.open("/api/export?format=csv"));
+document.getElementById("exportJsonBtn").addEventListener("click", () => window.open("/api/export?format=json"));
+
+// ---------------------------------------------------------------------------
+// Remediation Center (static reference content, code-level fix suggestions)
+// ---------------------------------------------------------------------------
+
+const REMEDIATIONS = [
+  {
+    title: "Cross-Site Scripting (XSS)", icon: "⚠",
+    desc: "Untrusted input is rendered without encoding, letting attacker-controlled scripts execute in the victim's browser.",
+    code: `// Encode output at the point of render\nconst safe = value\n  .replace(/&/g, "&amp;")\n  .replace(/</g, "&lt;")\n  .replace(/>/g, "&gt;");\nel.textContent = value; // prefer textContent over innerHTML`,
+  },
+  {
+    title: "Open / Unauthenticated Ports", icon: "◍",
+    desc: "Services exposed on the network without access controls (e.g. Telnet, RDP, unauthenticated admin panels).",
+    code: `# Restrict with a firewall rule\nufw allow from 10.0.0.0/8 to any port 22\nufw deny 23    # disable telnet entirely`,
+  },
+  {
+    title: "Outdated / Vulnerable Service Banner", icon: "◈",
+    desc: "A fingerprinted service version has known CVEs. Patch or upgrade rather than relying on obscurity.",
+    code: `# Debian/Ubuntu example\napt list --upgradable\napt install --only-upgrade <package>`,
+  },
+  {
+    title: "Exposed Sensitive Files (.env, .git, .sql)", icon: "▤",
+    desc: "Backup, config, or version-control files reachable over HTTP can leak credentials or source code.",
+    code: `# Nginx: block dotfiles and backups\nlocation ~ /\\.(?!well-known) { deny all; }\nlocation ~* \\.(bak|sql|env)$ { deny all; }`,
+  },
+  {
+    title: "Reflected Parameter Injection", icon: "✦",
+    desc: "A URL parameter is echoed into a response or query without validation, enabling injection attacks.",
+    code: `// Validate & allow-list rather than blocklist\nconst ALLOWED = new Set(["asc", "desc"]);\nif (!ALLOWED.has(sortParam)) sortParam = "asc";`,
+  },
+  {
+    title: "Weak Credential Storage", icon: "⛊",
+    desc: "Passwords hashed with fast, unsalted algorithms are crackable at scale offline.",
+    code: `# Use a slow, salted KDF\nfrom argon2 import PasswordHasher\nph = PasswordHasher()\nhash = ph.hash(password)`,
+  },
+];
+
+function renderRemediation() {
+  const grid = document.getElementById("remediationGrid");
+  grid.innerHTML = REMEDIATIONS.map(r => `
+    <div class="remediation-card">
+      <h3>${r.icon} ${escapeHtml(r.title)}</h3>
+      <p>${escapeHtml(r.desc)}</p>
+      <pre>${escapeHtml(r.code)}</pre>
+    </div>
+  `).join("");
+}
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+function escapeHtml(str) {
+  if (str === null || str === undefined) return "";
+  return String(str)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+async function refreshAll() {
+  await Promise.all([refreshStats(), loadEvents()]);
+  renderPivotList();
+}
+
+// ---------------------------------------------------------------------------
+// Boot
+// ---------------------------------------------------------------------------
+
+(async function init() {
+  connectWs();
+  renderRemediation();
+  await loadTools();
+  await refreshAll();
+  setInterval(refreshStats, 15000);
+})();

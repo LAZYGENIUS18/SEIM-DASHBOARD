@@ -1,0 +1,273 @@
+"""
+Parsers normalize each tool's raw stdout into a common event schema:
+
+    {
+        "timestamp": ISO8601 str,
+        "severity": "info" | "low" | "medium" | "high" | "critical",
+        "source_ip": str | None,
+        "host": str | None,
+        "finding_type": str,
+        "message": str,
+    }
+
+Every parser is defensive: malformed lines are skipped rather than raising,
+since real tool output is messy and partial results are still useful.
+"""
+
+import json
+import re
+from datetime import datetime, timezone
+
+IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _extract_ip(text, fallback_target=""):
+    m = IP_RE.search(text)
+    if m:
+        return m.group(0)
+    return fallback_target or None
+
+
+def parse_generic(raw_output: str, target: str = ""):
+    """Fallback parser: one info-level event per non-empty line, capped."""
+    events = []
+    for line in raw_output.splitlines()[:200]:
+        line = line.strip()
+        if not line or line.startswith("$"):
+            continue
+        events.append({
+            "timestamp": _now(),
+            "severity": "info",
+            "source_ip": _extract_ip(line, target),
+            "host": target,
+            "finding_type": "output",
+            "message": line[:500],
+        })
+    return events
+
+
+def parse_httpx(raw_output: str, target: str = ""):
+    events = []
+    for line in raw_output.splitlines():
+        m = re.match(r"(.+?) -> HTTP (\d+) \[(\d+)ms\] server=(\S+) content-length=(\d+)", line)
+        if not m:
+            continue
+        url, status, ms, server, clen = m.groups()
+        status = int(status)
+        severity = "info"
+        if status >= 500:
+            severity = "medium"
+        elif status in (401, 403):
+            severity = "low"
+        events.append({
+            "timestamp": _now(),
+            "severity": severity,
+            "source_ip": _extract_ip(url, target),
+            "host": url,
+            "finding_type": "http_probe",
+            "message": f"HTTP {status} from {server} in {ms}ms (content-length {clen})",
+        })
+    return events
+
+
+def parse_nmap(raw_output: str, target: str = ""):
+    events = []
+    host_ip = _extract_ip(raw_output, target)
+    for line in raw_output.splitlines():
+        m = re.match(r"(\d+)/(tcp|udp)\s+(open|filtered|closed)\s+(\S+)(?:\s+(.*))?", line.strip())
+        if not m:
+            continue
+        port, proto, state, service, version = m.groups()
+        if state != "open":
+            continue
+        severity = "info"
+        risky_services = {"telnet": "high", "ftp": "medium", "rdp": "high", "vnc": "high", "smb": "medium"}
+        severity = risky_services.get(service.lower(), "low" if int(port) < 1024 else "info")
+        version_str = f" ({version.strip()})" if version else ""
+        events.append({
+            "timestamp": _now(),
+            "severity": severity,
+            "source_ip": host_ip,
+            "host": target,
+            "finding_type": "open_port",
+            "message": f"Port {port}/{proto} open — {service}{version_str}",
+        })
+    return events
+
+
+def parse_subfinder(raw_output: str, target: str = ""):
+    events = []
+    for line in raw_output.splitlines():
+        sub = line.strip()
+        if not sub or "." not in sub:
+            continue
+        events.append({
+            "timestamp": _now(),
+            "severity": "info",
+            "source_ip": None,
+            "host": sub,
+            "finding_type": "subdomain",
+            "message": f"Discovered subdomain: {sub}",
+        })
+    return events
+
+
+def parse_nuclei(raw_output: str, target: str = ""):
+    events = []
+    for line in raw_output.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        info = obj.get("info", {})
+        severity = info.get("severity", "info")
+        host = obj.get("host") or obj.get("matched-at") or target
+        events.append({
+            "timestamp": obj.get("timestamp", _now()),
+            "severity": severity,
+            "source_ip": _extract_ip(host, target),
+            "host": host,
+            "finding_type": info.get("name", "nuclei_finding"),
+            "message": f"{info.get('name', 'Finding')} matched at {host}",
+        })
+    return events
+
+
+def parse_katana(raw_output: str, target: str = ""):
+    events = []
+    for line in raw_output.splitlines():
+        url = line.strip()
+        if not url:
+            continue
+        events.append({
+            "timestamp": _now(),
+            "severity": "info",
+            "source_ip": None,
+            "host": url,
+            "finding_type": "crawled_url",
+            "message": f"Crawled: {url}",
+        })
+    return events
+
+
+def parse_gau(raw_output: str, target: str = ""):
+    events = []
+    for line in raw_output.splitlines():
+        url = line.strip()
+        if not url:
+            continue
+        severity = "low" if re.search(r"\.(env|git|sql|bak|config)(\?|$)", url) else "info"
+        events.append({
+            "timestamp": _now(),
+            "severity": severity,
+            "source_ip": None,
+            "host": url,
+            "finding_type": "known_url",
+            "message": f"Historic URL: {url}",
+        })
+    return events
+
+
+def parse_ffuf(raw_output: str, target: str = ""):
+    events = []
+    try:
+        obj = json.loads(raw_output) if raw_output.strip().startswith("{") else None
+    except json.JSONDecodeError:
+        obj = None
+    if obj and "results" in obj:
+        for r in obj["results"]:
+            events.append({
+                "timestamp": _now(),
+                "severity": "low",
+                "source_ip": None,
+                "host": r.get("url", target),
+                "finding_type": "fuzzed_path",
+                "message": f"Found path {r.get('input', {}).get('FUZZ', '?')} -> "
+                           f"status {r.get('status')} ({r.get('length')} bytes)",
+            })
+    else:
+        events = parse_generic(raw_output, target)
+    return events
+
+
+def parse_naabu(raw_output: str, target: str = ""):
+    events = []
+    for line in raw_output.splitlines():
+        line = line.strip()
+        m = re.match(r"([\w.\-]+):(\d+)", line)
+        if not m:
+            continue
+        host, port = m.groups()
+        events.append({
+            "timestamp": _now(),
+            "severity": "low" if int(port) < 1024 else "info",
+            "source_ip": _extract_ip(host, target),
+            "host": host,
+            "finding_type": "open_port",
+            "message": f"Port {port} open on {host}",
+        })
+    return events
+
+
+def parse_rustscan(raw_output: str, target: str = ""):
+    events = []
+    for line in raw_output.splitlines():
+        m = re.search(r"Open\s+([\w.\-]+):(\d+)", line)
+        if not m:
+            continue
+        host, port = m.groups()
+        events.append({
+            "timestamp": _now(),
+            "severity": "low" if int(port) < 1024 else "info",
+            "source_ip": _extract_ip(host, target),
+            "host": host,
+            "finding_type": "open_port",
+            "message": f"Port {port} open on {host}",
+        })
+    return events
+
+
+def parse_dalfox(raw_output: str, target: str = ""):
+    events = []
+    for line in raw_output.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        events.append({
+            "timestamp": _now(),
+            "severity": "high",
+            "source_ip": None,
+            "host": obj.get("url", target),
+            "finding_type": "xss",
+            "message": f"Possible XSS: {obj.get('type', 'reflected')} at param "
+                       f"{obj.get('param', '?')}",
+        })
+    return events
+
+
+def parse_linkfinder(raw_output: str, target: str = ""):
+    events = []
+    for line in raw_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        events.append({
+            "timestamp": _now(),
+            "severity": "low",
+            "source_ip": None,
+            "host": target,
+            "finding_type": "js_endpoint",
+            "message": f"Endpoint found in JS: {line}",
+        })
+    return events

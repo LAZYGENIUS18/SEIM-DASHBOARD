@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CyberShield — Security Operations Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.3/chart.umd.min.js"></script>
+</head>
+<body>
+
+<div class="app-shell">
+
+  <!-- ============ SIDEBAR ============ -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">
+        <svg viewBox="0 0 40 40" class="shield-icon"><path d="M20 2 L36 8 V19 C36 29 29 36 20 38 C11 36 4 29 4 19 V8 Z" fill="none" stroke="currentColor" stroke-width="2"/><path d="M13 20 L18 25 L28 14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div class="brand-text">
+        <span class="brand-name">CyberShield</span>
+        <span class="brand-sub">SOC Console</span>
+      </div>
+    </div>
+
+    <nav class="nav-tabs">
+      <button class="nav-tab active" data-tab="overview">
+        <span class="nav-icon">◈</span> Overview
+      </button>
+      <button class="nav-tab" data-tab="tools">
+        <span class="nav-icon">▣</span> Tool Center
+      </button>
+      <button class="nav-tab" data-tab="terminal">
+        <span class="nav-icon">▶</span> Live Terminal
+      </button>
+      <button class="nav-tab" data-tab="events">
+        <span class="nav-icon">▤</span> Findings &amp; Events
+      </button>
+      <button class="nav-tab" data-tab="forensic">
+        <span class="nav-icon">◎</span> Forensic Investigator
+      </button>
+      <button class="nav-tab" data-tab="remediation">
+        <span class="nav-icon">✓</span> Remediation Center
+      </button>
+    </nav>
+
+    <div class="sidebar-footer">
+      <div class="conn-status" id="wsStatus">
+        <span class="dot"></span> <span class="conn-label">Connecting…</span>
+      </div>
+      <div class="authz-note">
+        Scan only systems you own or are<br>explicitly authorized to test.
+      </div>
+    </div>
+  </aside>
+
+  <!-- ============ MAIN ============ -->
+  <main class="main">
+
+    <!-- ============ TAB: OVERVIEW ============ -->
+    <section class="tab-panel active" id="tab-overview">
+      <header class="panel-header">
+        <div>
+          <h1>Dashboard Overview</h1>
+          <p class="subhead">Live posture across every executed scan</p>
+        </div>
+        <div class="header-stats" id="headerStats"></div>
+      </header>
+
+      <div class="grid-overview">
+        <div class="card shield-card">
+          <div class="card-label">Shield Score</div>
+          <div class="shield-gauge-wrap">
+            <svg viewBox="0 0 160 160" class="shield-gauge">
+              <circle cx="80" cy="80" r="68" class="gauge-track"/>
+              <circle cx="80" cy="80" r="68" class="gauge-fill" id="gaugeFill"/>
+            </svg>
+            <div class="gauge-center">
+              <span class="gauge-value" id="shieldScoreValue">--</span>
+              <span class="gauge-unit">/ 100</span>
+            </div>
+          </div>
+          <div class="gauge-legend" id="gaugeLegend">Awaiting first scan…</div>
+        </div>
+
+        <div class="card kpi-card">
+          <div class="card-label">Key Indicators</div>
+          <div class="kpi-grid">
+            <div class="kpi"><span class="kpi-num" id="kpiEvents">0</span><span class="kpi-label">Total Findings</span></div>
+            <div class="kpi"><span class="kpi-num" id="kpiRuns">0</span><span class="kpi-label">Tool Runs</span></div>
+            <div class="kpi"><span class="kpi-num" id="kpiCritical">0</span><span class="kpi-label">Critical</span></div>
+            <div class="kpi"><span class="kpi-num" id="kpiHigh">0</span><span class="kpi-label">High</span></div>
+            <div class="kpi"><span class="kpi-num" id="kpiTools">0/0</span><span class="kpi-label">Tools Ready</span></div>
+            <div class="kpi"><span class="kpi-num" id="kpiCorr">0</span><span class="kpi-label">Correlated Alerts</span></div>
+          </div>
+        </div>
+
+        <div class="card chart-card">
+          <div class="card-label">Findings Trend</div>
+          <canvas id="trendChart" height="140"></canvas>
+        </div>
+
+        <div class="card chart-card">
+          <div class="card-label">Risk Distribution</div>
+          <canvas id="riskDoughnut" height="180"></canvas>
+        </div>
+
+        <div class="card chart-card">
+          <div class="card-label">Impacted Modules</div>
+          <canvas id="moduleRadar" height="180"></canvas>
+        </div>
+
+        <div class="card ticker-card">
+          <div class="card-label">Live Event Ticker</div>
+          <div class="ticker" id="eventTicker">
+            <div class="ticker-empty">No events yet — launch a tool from the Tool Center to begin.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ TAB: TOOL CENTER ============ -->
+    <section class="tab-panel" id="tab-tools">
+      <header class="panel-header">
+        <div>
+          <h1>Tool Center</h1>
+          <p class="subhead">Configure parameters and launch a real scan</p>
+        </div>
+      </header>
+      <div class="tool-grid" id="toolGrid">
+        <div class="tool-card-loading">Loading tool inventory…</div>
+      </div>
+    </section>
+
+    <!-- ============ TAB: LIVE TERMINAL ============ -->
+    <section class="tab-panel" id="tab-terminal">
+      <header class="panel-header">
+        <div>
+          <h1>Live Terminal</h1>
+          <p class="subhead">Real-time subprocess output over WebSocket</p>
+        </div>
+        <button class="btn-ghost" id="clearTerminalBtn">Clear</button>
+      </header>
+      <div class="terminal" id="terminalOutput">
+        <div class="term-line term-muted">Waiting for a tool run… launch one from the Tool Center.</div>
+      </div>
+    </section>
+
+    <!-- ============ TAB: FINDINGS & EVENTS ============ -->
+    <section class="tab-panel" id="tab-events">
+      <header class="panel-header">
+        <div>
+          <h1>Findings &amp; Events</h1>
+          <p class="subhead">Every normalized event across all tool runs</p>
+        </div>
+      </header>
+      <div class="filter-bar">
+        <input type="text" id="eventSearch" placeholder="Search host, IP, or message…">
+        <select id="severityFilter">
+          <option value="">All severities</option>
+          <option value="critical">Critical</option>
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+          <option value="info">Info</option>
+        </select>
+        <button class="btn-primary" id="applyFilters">Filter</button>
+      </div>
+      <div class="table-wrap">
+        <table class="events-table">
+          <thead>
+            <tr>
+              <th>Time</th><th>Severity</th><th>Tool</th><th>Host / IP</th><th>Type</th><th>Message</th>
+            </tr>
+          </thead>
+          <tbody id="eventsTableBody">
+            <tr><td colspan="6" class="empty-row">No findings recorded yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ============ TAB: FORENSIC INVESTIGATOR ============ -->
+    <section class="tab-panel" id="tab-forensic">
+      <header class="panel-header">
+        <div>
+          <h1>Forensic Investigator</h1>
+          <p class="subhead">Pivot by host or IP, inspect full event metadata</p>
+        </div>
+        <div class="export-buttons">
+          <button class="btn-ghost" id="exportCsvBtn">Export CSV</button>
+          <button class="btn-ghost" id="exportJsonBtn">Export JSON</button>
+        </div>
+      </header>
+      <div class="forensic-layout">
+        <div class="card pivot-card">
+          <div class="card-label">Pivot Targets</div>
+          <div id="pivotList" class="pivot-list">
+            <div class="pivot-empty">Sources will appear here once events exist.</div>
+          </div>
+        </div>
+        <div class="card timeline-card">
+          <div class="card-label" id="timelineLabel">Event Timeline</div>
+          <div id="timeline" class="timeline">
+            <div class="timeline-empty">Select a pivot target to view its timeline.</div>
+          </div>
+        </div>
+        <div class="card meta-card">
+          <div class="card-label">Metadata Viewer</div>
+          <pre id="metaViewer" class="meta-viewer">Click an event in the timeline to inspect it.</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ TAB: REMEDIATION CENTER ============ -->
+    <section class="tab-panel" id="tab-remediation">
+      <header class="panel-header">
+        <div>
+          <h1>Remediation Center</h1>
+          <p class="subhead">Common vulnerability classes and how to fix them</p>
+        </div>
+      </header>
+      <div class="remediation-grid" id="remediationGrid"></div>
+    </section>
+
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
